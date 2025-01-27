@@ -1,110 +1,99 @@
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
-#include <ESP8266HTTPClient.h>
-#include <ESP8266httpUpdate.h>
+#include <ArduinoOTA.h>
 
 // Credenciales WiFi
 const char* ssid = "IngenieriaPM";
 const char* password = "ingenieriatech";
 
-// Configuración de ThingsBoard
-const char* mqtt_server = "iot.redelocker.com";  // Cambia si usas otro servidor
-const char* token = "yo0hjotu99whp5du8vpr";  // Token de acceso del dispositivo
-const int mqtt_port = 1883;      // Puerto MQTT estándar sin SSL
+// Configuración de ThingsBoard MQTT
+const char* mqtt_server = "iot.redelocker.com";
+const int mqtt_port = 1883;
+const char* token = "yo0hjotu99whp5du8vpr";
+
+// Last telemetry time
+static unsigned long lastTelemetry = 0;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// Función para actualizar el firmware desde una URL
-void updateFirmware(const char* firmwareUrl) {
-    Serial.println("Iniciando actualización OTA desde: " + String(firmwareUrl));
-    
-    WiFiClient client;
-    ESPhttpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-
-    t_httpUpdate_return result = ESPhttpUpdate.update(client, firmwareUrl);
-
-    switch (result) {
-        case HTTP_UPDATE_FAILED:
-            Serial.printf("Error en la actualización OTA: %s\n", ESPhttpUpdate.getLastErrorString().c_str());
-            break;
-        case HTTP_UPDATE_NO_UPDATES:
-            Serial.println("No hay nuevas actualizaciones.");
-            break;
-        case HTTP_UPDATE_OK:
-            Serial.println("Actualización exitosa, reiniciando...");
-            ESP.restart();
-            break;
-    }
-}
-
-// Callback para recibir atributos compartidos desde ThingsBoard
-void callback(char* topic, byte* payload, unsigned int length) {
-    Serial.print("Mensaje recibido [");
-    Serial.print(topic);
-    Serial.print("]: ");
-    
-    String message;
-    for (unsigned int i = 0; i < length; i++) {
-        message += (char)payload[i];
-    }
-    Serial.println(message);
-
-    // Busca la clave "fw_url" en el mensaje recibido
-    if (message.indexOf("fw_url") != -1) {
-        int start = message.indexOf("fw_url") + 9; // Salta "fw_url":""
-        int end = message.indexOf("\"", start);
-        String firmwareUrl = message.substring(start, end);
-        Serial.println("URL de firmware recibida: " + firmwareUrl);
-        
-        // Llamar a la función de actualización
-        updateFirmware(firmwareUrl.c_str());
-    }
-}
-
-// Conectar a WiFi
+// Función para conectar a WiFi
 void setup_wifi() {
     Serial.print("Conectando a ");
     Serial.println(ssid);
-    
+
     WiFi.begin(ssid, password);
 
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
     }
-    Serial.println("\nConexión WiFi establecida.");
+
+    Serial.println("\nWiFi conectado, IP: " + WiFi.localIP().toString());
 }
 
-// Conectar al servidor de ThingsBoard
+// Función para conectar a ThingsBoard
 void reconnect() {
     while (!client.connected()) {
-        Serial.print("Intentando conectar a ThingsBoard... ");
+        Serial.print("Conectando a ThingsBoard...");
         if (client.connect("ESP8266", token, "")) {
             Serial.println("Conectado!");
-            client.subscribe("v1/devices/me/attributes");  // Suscribirse a atributos compartidos
+            client.subscribe("v1/devices/me/attributes");  // Escuchar atributos compartidos
         } else {
-            Serial.print("Error de conexión, rc=");
+            Serial.print("Error, rc=");
             Serial.print(client.state());
-            Serial.println(" Intentando de nuevo en 5 segundos...");
+            Serial.println(" Reintentando en 5 segundos...");
             delay(5000);
         }
     }
 }
 
+// Configuración de OTA
+void setupOTA() {
+    ArduinoOTA.setHostname("ESP8266-OTA");
+    ArduinoOTA.setPassword("admin");  // Cambiar por una contraseña segura
+
+    ArduinoOTA.onStart([]() {
+        Serial.println("Inicio de actualización OTA...");
+    });
+
+    ArduinoOTA.onEnd([]() {
+        Serial.println("Actualización completada, reiniciando...");
+    });
+
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        Serial.printf("Progreso: %u%%\r", (progress / (total / 100)));
+    });
+
+    ArduinoOTA.onError([](ota_error_t error) {
+        Serial.printf("Error OTA [%u]: ", error);
+        if (error == OTA_AUTH_ERROR) Serial.println("Error de autenticación");
+        else if (error == OTA_BEGIN_ERROR) Serial.println("Error al iniciar");
+        else if (error == OTA_CONNECT_ERROR) Serial.println("Error de conexión");
+        else if (error == OTA_RECEIVE_ERROR) Serial.println("Error de recepción");
+        else if (error == OTA_END_ERROR) Serial.println("Error al finalizar");
+    });
+
+    ArduinoOTA.begin();
+    Serial.println("OTA lista, esperando actualizaciones...");
+}
 
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(9600);
+    pinMode(LED_BUILTIN, OUTPUT);
     setup_wifi();
-
     client.setServer(mqtt_server, mqtt_port);
-    client.setCallback(callback);
-
     reconnect();
+    setupOTA();
+}
 
-    // Solicita la URL del firmware en ThingsBoard
-    client.publish("v1/devices/me/attributes/request", "{\"clientKeys\":\"fw_url\"}");
-    Serial.println("Solicitud enviada para obtener la URL del firmware...");
+// Función para enviar telemetría periódica
+void sendTelemetry() {
+    if (client.connected()) {
+        String telemetry = "{\"temperature\": 25.5, \"humidity\": 60}";
+        client.publish("v1/devices/me/telemetry", telemetry.c_str());
+        Serial.println("Millis: " + String(millis()) + " - Telemetría enviada: " + telemetry);
+    }
 }
 
 void loop() {
@@ -112,4 +101,18 @@ void loop() {
         reconnect();
     }
     client.loop();
+    ArduinoOTA.handle();  // Escucha actualizaciones OTA
+
+    if (millis() - lastTelemetry > 5000) {
+        digitalWrite(LED_BUILTIN, LOW);
+        sendTelemetry();
+        lastTelemetry = millis();
+    } else {
+        digitalWrite(LED_BUILTIN, HIGH);
+        delay(1000);
+        digitalWrite(LED_BUILTIN, LOW);
+        delay(1000);
+        digitalWrite(LED_BUILTIN, HIGH);
+        delay(1000);
+    }
 }
